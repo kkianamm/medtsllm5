@@ -466,11 +466,31 @@ class MedTsLLM(nn.Module):
 
         return dec_out
 
+    def _get_text_encoder(self):
+        """Return the module that turns text embeddings into contextualized
+        text features.
+
+        For an encoder-decoder backbone (e.g. FLAN-T5) the class descriptions
+        must go through the *encoder* only: calling the full model without
+        decoder inputs would error, and even a successful call would return
+        decoder states, not the text representation we want for prototypes.
+        For a decoder-only backbone the model itself is the text encoder.
+        Handles a PEFT/LoRA wrapper transparently.
+        """
+        llm = getattr(self.llm, "base_model", self.llm)
+        llm = getattr(llm, "model", llm)            # unwrap PeftModel -> base
+        if self.llm.config.is_encoder_decoder:
+            if hasattr(self.llm, "get_encoder"):
+                return self.llm.get_encoder()
+            return llm.get_encoder()
+        return self.llm
+
     def _encode_text_pooled(self, texts):
-        """Encode a list of strings with the frozen LLM and pool over tokens.
+        """Encode a list of strings with the frozen text encoder and pool tokens.
 
         Returns [len(texts), d_llm]. Mirrors a CLIP text encoder: run the text
-        through the (frozen) backbone, then pool (masked-mean or last token).
+        through the (frozen) encoder, then pool (masked-mean or last token).
+        Works for both decoder-only and encoder-decoder backbones.
         """
         tok = self.tokenizer(
             texts, return_tensors="pt", padding=True, truncation=True, max_length=64,
@@ -478,12 +498,14 @@ class MedTsLLM(nn.Module):
         input_ids = tok.input_ids.to(self.device)
         attn = tok.attention_mask.to(self.device)
         embeds = self.llm.get_input_embeddings()(input_ids)
-        out = self.llm(inputs_embeds=embeds, attention_mask=attn).last_hidden_state
+        encoder = self._get_text_encoder()
+        out = encoder(inputs_embeds=embeds, attention_mask=attn).last_hidden_state
         out = out.to(embeds.dtype)
         if self.bc_pool == "last":
+            # T5 has no BOS/EOS-at-start convention issue here; last *real* token.
             idx = attn.sum(dim=1) - 1
             pooled = out[torch.arange(out.size(0), device=out.device), idx]
-        else:  # masked mean
+        else:  # masked mean (recommended for encoder-decoder text encoders)
             m = attn.unsqueeze(-1).to(out.dtype)
             pooled = (out * m).sum(dim=1) / m.sum(dim=1).clamp_min(1e-6)
         return pooled
